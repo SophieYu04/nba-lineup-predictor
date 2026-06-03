@@ -509,12 +509,14 @@ p80_thresholds.to_csv(MODELS / "p80_thresholds.csv", index=False)
 # Save fitted artifacts via joblib
 joblib.dump(xgb_clf,    MODELS / "xgb_output_A.joblib")
 joblib.dump(logit_B,    MODELS / "logit_output_B.joblib")
+joblib.dump(logit_C,    MODELS / "logit_output_C.joblib")
 joblib.dump(final_clf,  MODELS / "final_logit.joblib")
 joblib.dump(scaler_A,   MODELS / "scaler_A.joblib")
 joblib.dump(scaler_B,   MODELS / "scaler_B.joblib")
+joblib.dump(scaler_C,   MODELS / "scaler_C.joblib")
 joblib.dump(scaler_pm,  MODELS / "scaler_pm.joblib")
 
-# Column-order metadata for both feature sets
+# Column-order metadata for all three feature sets
 with open(MODELS / "feature_meta.json", "w") as f:
     json.dump({
         "output_A_features": feats_present,
@@ -524,8 +526,27 @@ with open(MODELS / "feature_meta.json", "w") as f:
             f"{a}|{b}"
             for i, a in enumerate(ALL_DUMMIES) for b in ALL_DUMMIES[i + 1:]
         ],
+        "output_C_features": c_feat_cols,
+        "output_C_pairs": [
+            f"home:{h}|away:{a}" for h in DUMMY_STATS for a in DUMMY_STATS
+        ],
         "final_feature_order": FINAL_FEATS,
     }, f, indent=2)
 
-print(f"  Saved: {MODELS}/ (6 models + 2 metadata files)")
+# Interpretability: export Score C survivors with their L1 coefficients.
+# Rows sorted by |coef| so reviewers can scan the strongest cross-team
+# pairs first; zero-weight features dropped (they're not survivors).
+cross_team_pairs = pd.DataFrame({
+    "feature":   c_feat_cols,
+    "home_skill": [f"d_{h}" for h in DUMMY_STATS for _ in DUMMY_STATS],
+    "away_skill": [f"d_{a}" for _ in DUMMY_STATS for a in DUMMY_STATS],
+    "coef":      clf_C.coef_[0],
+})
+cross_team_pairs = cross_team_pairs[cross_team_pairs["coef"] != 0].copy()
+cross_team_pairs["abs_coef"] = cross_team_pairs["coef"].abs()
+cross_team_pairs = cross_team_pairs.sort_values("abs_coef", ascending=False)
+cross_team_pairs.to_csv(OUT / "cross_team_pairs.csv", index=False)
+
+print(f"  Saved: {MODELS}/ (8 models + 2 metadata files)")
+print(f"  Saved: {OUT / 'cross_team_pairs.csv'}")
 print("\nDone.")
