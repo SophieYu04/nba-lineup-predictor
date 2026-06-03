@@ -1,19 +1,21 @@
 """
-Design B: Score A (XGBoost per-player → SHAP) + Score B (Logit lineup dummy) → final.
+Design B: Score A (XGB+SHAP) + Score B (logit, team-internal) + Score C
+(L1 logit, cross-team) → final.
 
 Pipeline
 --------
 1. Time-based split: train = 2020-21 ~ 2023-24, test = 2024-25
 2. Sample alignment: intersect game_ids that both models can handle
 3. Output A: per-player XGBoost → SHAP → Σ per team-game → Score_A
-4. Output B: lineup dummy max/sum → logit → decision_function → Score_B
-5. Final calibration: P = σ(α·ΔA + β·ΔB + γ·is_home + b)
+4. Output B: lineup dummy max/sum + 36 within-team interactions → logit → Score_B
+5. Output C: 9×9 cross-team sum×sum interactions → L1 logit → Score_C (per matchup)
+6. Final calibration: P = σ(α·ΔA + β·ΔB + ζ·C + δ·Δpm + γ·is_home + b)
 
 Outputs
 -------
-- predictions_test.csv : per-matchup predictions with Score_A, Score_B, P_home
+- predictions_test.csv : per-matchup predictions incl. Score_A/B/C and P_home
 - player_shap.csv      : per-(game, team, player) SHAP contributions (Score_A 解釋性)
-- final_weights.json   : α, β, γ, intercept
+- final_weights.json   : α, β, ζ, δ, γ, intercept
 """
 
 import json
@@ -25,9 +27,10 @@ import numpy as np
 import pandas as pd
 import shap
 import xgboost as xgb
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
 from sklearn.model_selection import KFold
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -257,6 +260,88 @@ print(f"  team-games with team_pm: {len(team_pm):,}")
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 6c. Output C: per-matchup cross-team skill interactions (L1 logit)
+#     9 home skills × 9 away skills = 81 interactions; L1 picks survivors.
+#     score_C is matchup-level (already directional), no diff needed.
+# ──────────────────────────────────────────────────────────────────────
+print("[6c] Building Output C cross-team interaction features ...")
+
+sum_cols = [f"d_{c}_sum" for c in DUMMY_STATS]
+team_sums = agg[["game_id", "team"] + sum_cols].copy()
+
+home_sums = team_sums.rename(
+    columns={"team": "home_team", **{c: f"h_{c}" for c in sum_cols}}
+)
+away_sums = team_sums.rename(
+    columns={"team": "away_team", **{c: f"a_{c}" for c in sum_cols}}
+)
+
+cross_frame = games[["game_id", "season", "home_team", "away_team", "home_win"]].copy()
+cross_frame = cross_frame.merge(home_sums, on=["game_id", "home_team"], how="inner")
+cross_frame = cross_frame.merge(away_sums, on=["game_id", "away_team"], how="inner")
+
+c_feat_cols = []
+for h_skill in DUMMY_STATS:
+    for a_skill in DUMMY_STATS:
+        col = f"c_h_{h_skill}_a_{a_skill}"
+        cross_frame[col] = (
+            cross_frame[f"h_d_{h_skill}_sum"] * cross_frame[f"a_d_{a_skill}_sum"]
+        )
+        c_feat_cols.append(col)
+
+print(f"  cross-team features: {len(c_feat_cols)} (9x9)")
+
+C_train = cross_frame[cross_frame["season"].isin(TRAIN_SEASONS)].reset_index(drop=True)
+C_test  = cross_frame[cross_frame["season"].eq(TEST_SEASON)].reset_index(drop=True)
+print(f"  matchups: train={len(C_train):,}  test={len(C_test):,}")
+
+
+def build_logit_C():
+    # L1 needs scaled inputs; pipeline keeps train/inference consistent.
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegressionCV(
+            Cs=np.logspace(-3, 1, 20),
+            penalty="l1",
+            solver="saga",
+            max_iter=5000,
+            cv=5,
+            scoring="roc_auc",
+            n_jobs=-1,
+            random_state=42,
+        )),
+    ])
+
+
+C_train["score_C_raw"] = np.nan
+train_game_ids_C = C_train["game_id"].unique()
+for fold, (tr_g, va_g) in enumerate(kf.split(train_game_ids_C), 1):
+    tr_games = set(train_game_ids_C[tr_g])
+    va_games = set(train_game_ids_C[va_g])
+    tr_idx = C_train.index[C_train["game_id"].isin(tr_games)]
+    va_idx = C_train.index[C_train["game_id"].isin(va_games)]
+    pipe = build_logit_C()
+    pipe.fit(C_train.loc[tr_idx, c_feat_cols], C_train.loc[tr_idx, "home_win"])
+    C_train.loc[va_idx, "score_C_raw"] = pipe.decision_function(
+        C_train.loc[va_idx, c_feat_cols]
+    )
+    print(f"  fold {fold}/{OOF_FOLDS}: train {len(tr_idx):,} → OOF {len(va_idx):,}")
+
+logit_C = build_logit_C()
+logit_C.fit(C_train[c_feat_cols], C_train["home_win"])
+C_test["score_C_raw"] = logit_C.decision_function(C_test[c_feat_cols])
+
+clf_C = logit_C.named_steps["clf"]
+nonzero = int((clf_C.coef_[0] != 0).sum())
+print(f"  L1 kept {nonzero}/{len(c_feat_cols)} features  (C={clf_C.C_[0]:.4f})")
+
+score_C_all = pd.concat([
+    C_train[["game_id", "home_team", "away_team", "score_C_raw"]],
+    C_test[["game_id", "home_team", "away_team", "score_C_raw"]],
+], ignore_index=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 7. Build matchup-level features (ΔA, ΔB, Δpm, is_home)
 # ──────────────────────────────────────────────────────────────────────
 print("[7] Building matchup-level features ...")
@@ -290,6 +375,11 @@ matchup = matchup.merge(
     on=["game_id", "away_team"], how="inner",
 )
 
+# score_C is per-matchup (directional), merge directly — no diff
+matchup = matchup.merge(
+    score_C_all, on=["game_id", "home_team", "away_team"], how="inner",
+)
+
 matchup["delta_A_raw"]  = matchup["score_A_home"] - matchup["score_A_away"]
 matchup["delta_B_raw"]  = matchup["score_B_home"] - matchup["score_B_away"]
 matchup["delta_pm_raw"] = matchup["pm_home"]      - matchup["pm_away"]
@@ -299,29 +389,32 @@ M_train = matchup[matchup["season"].isin(TRAIN_SEASONS)].copy()
 M_test  = matchup[matchup["season"].eq(TEST_SEASON)].copy()
 print(f"  matchups: train={len(M_train):,}  test={len(M_test):,}")
 
-# Standardize all three Δ features using train-set statistics only
+# Standardize all Δ / Score features using train-set statistics only
 scaler_A  = StandardScaler().fit(M_train[["delta_A_raw"]])
 scaler_B  = StandardScaler().fit(M_train[["delta_B_raw"]])
 scaler_pm = StandardScaler().fit(M_train[["delta_pm_raw"]])
+scaler_C  = StandardScaler().fit(M_train[["score_C_raw"]])
 for df in (M_train, M_test):
     df["delta_A"]  = scaler_A.transform(df[["delta_A_raw"]]).ravel()
     df["delta_B"]  = scaler_B.transform(df[["delta_B_raw"]]).ravel()
     df["delta_pm"] = scaler_pm.transform(df[["delta_pm_raw"]]).ravel()
+    df["score_C"]  = scaler_C.transform(df[["score_C_raw"]]).ravel()
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 8. Final calibration: P = σ(α·ΔA + β·ΔB + δ·Δpm + γ·is_home + b)
+# 8. Final calibration: P = σ(α·ΔA + β·ΔB + ζ·C + δ·Δpm + γ·is_home + b)
 # ──────────────────────────────────────────────────────────────────────
 print("[8] Final calibration logit ...")
-FINAL_FEATS = ["delta_A", "delta_B", "delta_pm", "is_home"]
+FINAL_FEATS = ["delta_A", "delta_B", "score_C", "delta_pm", "is_home"]
 final_clf = LogisticRegression(C=1.0, max_iter=1000)
 final_clf.fit(M_train[FINAL_FEATS], M_train["home_win"])
 
-alpha, beta, delta_pm_coef, gamma = final_clf.coef_[0]
+alpha, beta, zeta, delta_pm_coef, gamma = final_clf.coef_[0]
 intercept = final_clf.intercept_[0]
 
 print(f"  α (Score_A weight)        = {alpha:+.4f}")
 print(f"  β (Score_B weight)        = {beta:+.4f}")
+print(f"  ζ (Score_C cross-team)    = {zeta:+.4f}")
 print(f"  δ (plus_minus_diff weight)= {delta_pm_coef:+.4f}")
 print(f"  γ (home advantage)        = {gamma:+.4f}")
 print(f"  intercept                 = {intercept:+.4f}")
@@ -348,13 +441,18 @@ def auc_for_cols(cols):
     return roc_auc_score(y_test, p)
 
 print(f"\n  Ablation AUC:")
-print(f"    Score_A only  + is_home : {auc_for_cols(['delta_A','is_home']):.4f}")
-print(f"    Score_B only  + is_home : {auc_for_cols(['delta_B','is_home']):.4f}")
-print(f"    Δpm only      + is_home : {auc_for_cols(['delta_pm','is_home']):.4f}")
-print(f"    A + B         + is_home : {auc_for_cols(['delta_A','delta_B','is_home']):.4f}")
-print(f"    A + Δpm       + is_home : {auc_for_cols(['delta_A','delta_pm','is_home']):.4f}")
-print(f"    B + Δpm       + is_home : {auc_for_cols(['delta_B','delta_pm','is_home']):.4f}")
-print(f"    A + B + Δpm   + is_home : {roc_auc_score(y_test, P_test):.4f}")
+print(f"    Score_A only  + is_home     : {auc_for_cols(['delta_A','is_home']):.4f}")
+print(f"    Score_B only  + is_home     : {auc_for_cols(['delta_B','is_home']):.4f}")
+print(f"    Score_C only  + is_home     : {auc_for_cols(['score_C','is_home']):.4f}")
+print(f"    Δpm only      + is_home     : {auc_for_cols(['delta_pm','is_home']):.4f}")
+print(f"    A + B         + is_home     : {auc_for_cols(['delta_A','delta_B','is_home']):.4f}")
+print(f"    A + Δpm       + is_home     : {auc_for_cols(['delta_A','delta_pm','is_home']):.4f}")
+print(f"    B + Δpm       + is_home     : {auc_for_cols(['delta_B','delta_pm','is_home']):.4f}")
+print(f"    A + B + Δpm   + is_home     : {auc_for_cols(['delta_A','delta_B','delta_pm','is_home']):.4f}")
+print(f"    A + C + Δpm   + is_home     : {auc_for_cols(['delta_A','score_C','delta_pm','is_home']):.4f}")
+print(f"    B + C + Δpm   + is_home     : {auc_for_cols(['delta_B','score_C','delta_pm','is_home']):.4f}")
+print(f"    A + B + C     + is_home     : {auc_for_cols(['delta_A','delta_B','score_C','is_home']):.4f}")
+print(f"    A + B + C + Δpm + is_home   : {roc_auc_score(y_test, P_test):.4f}")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -363,6 +461,7 @@ print(f"    A + B + Δpm   + is_home : {roc_auc_score(y_test, P_test):.4f}")
 out_test = M_test[["game_id", "game_date", "home_team", "away_team",
                    "score_A_home", "score_A_away", "delta_A_raw", "delta_A",
                    "score_B_home", "score_B_away", "delta_B_raw", "delta_B",
+                   "score_C_raw", "score_C",
                    "pm_home", "pm_away", "delta_pm_raw", "delta_pm",
                    "is_home", "home_win"]].copy()
 out_test["P_home_win"] = P_test
@@ -373,6 +472,7 @@ with open(OUT / "final_weights.json", "w") as f:
     json.dump({
         "alpha_score_A": float(alpha),
         "beta_score_B": float(beta),
+        "zeta_score_C": float(zeta),
         "delta_plus_minus": float(delta_pm_coef),
         "gamma_is_home": float(gamma),
         "intercept": float(intercept),
@@ -382,6 +482,8 @@ with open(OUT / "final_weights.json", "w") as f:
         "n_test_matchups": int(len(M_test)),
         "output_B_total_features": int(len(team_feat_cols_B)),
         "output_B_interaction_pairs": int(len(ALL_DUMMIES) * (len(ALL_DUMMIES) - 1) // 2),
+        "output_C_total_features": int(len(c_feat_cols)),
+        "output_C_l1_kept_features": int(nonzero),
     }, f, indent=2)
 
 print(f"\n  Saved: {OUT / 'predictions_test.csv'}")

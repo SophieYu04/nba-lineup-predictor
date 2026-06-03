@@ -133,6 +133,7 @@
   "final_feature_order": [
     "delta_A",
     "delta_B",
+    "score_C",
     "delta_pm",
     "is_home"
   ]

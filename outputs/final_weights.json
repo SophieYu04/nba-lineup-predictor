@@ -1,9 +1,10 @@
 {
-  "alpha_score_A": 0.34491767104613674,
-  "beta_score_B": 0.17055693499917501,
-  "delta_plus_minus": 0.3198147938861464,
-  "gamma_is_home": 0.11924680833612615,
-  "intercept": 0.12015047446420558,
+  "alpha_score_A": 0.34794163505201364,
+  "beta_score_B": 0.17638983052752177,
+  "zeta_score_C": -0.02286713114138892,
+  "delta_plus_minus": 0.3186763972316239,
+  "gamma_is_home": 0.11924880976395612,
+  "intercept": 0.12022544865943245,
   "train_seasons": [
     "2020-21",
     "2021-22",
@@ -14,5 +15,7 @@
   "n_train_matchups": 4722,
   "n_test_matchups": 1225,
   "output_B_total_features": 54,
-  "output_B_interaction_pairs": 36
+  "output_B_interaction_pairs": 36,
+  "output_C_total_features": 81,
+  "output_C_l1_kept_features": 31
 }
