@@ -2,28 +2,74 @@
 
 > 對應提案：`Final Report Proposal.pdf` §3「核心模型：XGBoost + Regression」
 > 實作檔：[`score_ab.py`](score_ab.py)
-> 評估方式：時序切分 **train = 2020-21 ~ 2023-24（4,722 場）/ test = 2024-25（1,225 場）**
+> 評估方式：時序切分 **train = 2020-21 ~ 2023-24 / test = 2024-25（1,225 場）**；final layer 使用 time-aware OOF 有分數的 3,935 場訓練 matchup
+
+---
+
+## 2026-06-04 demo-ready revision
+
+這份文件原本記錄 Score C 加入後的第一版 Design B/C 結果。demo 前已完成新版修正：
+
+- Score B 從 L2 logit 改成 `StandardScaler + LogisticRegressionCV(penalty="l1")`，54 個 features 留下 13 個。
+- Output A/B/C 的 OOF 都改成按 `game_date` 排序的 `TimeSeriesSplit`。
+- Score B 的 P80 threshold 改成每個 fold 的 train split 內部計算，測試季使用訓練期最新 threshold fallback。
+- `predict_lineup.py` 已補上 Score C inference，並新增 `symmetric=True` 做中性場強弱比較。
+- 新增 calibration bucket 診斷輸出，特別追蹤 0.45-0.50 bucket。
+
+新版 hold-out 結果：
+
+| 指標 | 數值 |
+|---|---:|
+| **Test AUC** | **0.7280** |
+| **Test Accuracy** | **0.6759** |
+| Baseline（永遠猜 home win） | 0.5445 |
+| Final train matchups | 3,935 |
+| Test matchups | 1,225 |
+| Output B 特徵維度 | 54，L1 保留 13 |
+| Output C 特徵維度 | 81，L1 保留 31 |
+
+新版 final layer：
+
+```
+P(home wins) = σ(0.1885·ΔA + 0.1810·ΔB − 0.0179·C
+                 + 0.4818·Δpm + 0.1280·is_home + 0.1290)
+```
+
+新版 ablation：
+
+| 組合 | Test AUC |
+|---|---:|
+| Score_A only + is_home | 0.6661 |
+| Score_B only + is_home | 0.6624 |
+| Score_C only + is_home | 0.5832 |
+| Δpm only + is_home | 0.7164 |
+| A + B + is_home | 0.6941 |
+| B + Δpm + is_home | 0.7264 |
+| A + B + Δpm + is_home | 0.7280 |
+| A + B + C + Δpm + is_home | 0.7280 |
+
+解讀：AUC 提升到 0.7280，但 Accuracy 在 0.5 threshold 下略降。Score C 仍然不是主要預測訊號；它的價值比較偏解釋與報告敘事。
 
 ---
 
 ## 一、最終結果
 
 ```
-P(home wins) = σ(0.348·ΔA + 0.176·ΔB − 0.023·C + 0.319·Δpm + 0.119·is_home + 0.120)
+P(home wins) = σ(0.1885·ΔA + 0.1810·ΔB − 0.0179·C + 0.4818·Δpm + 0.1280·is_home + 0.1290)
 ```
 
 | 指標 | 數值 |
 |---|---:|
-| **Test AUC** | **0.7236** |
-| **Test Accuracy** | **0.6808** |
+| **Test AUC** | **0.7280** |
+| **Test Accuracy** | **0.6759** |
 | Baseline（永遠猜 home win） | 0.5445 |
-| Train 樣本數 | 4,722 matchups |
+| Train 樣本數 | 3,935 matchups |
 | Test 樣本數 | 1,225 matchups |
 | Output A 訓練樣本（per-player） | 83,640 rows |
-| Output B 特徵維度 | 54（18 max+sum × 9 stats + 36 內部交乘對） |
+| Output B 特徵維度 | 54（18 max+sum × 9 stats + 36 內部交乘對），L1 保留 13 |
 | Output C 特徵維度 | 81（9 主隊技能 × 9 客隊技能），L1 保留 31 |
 
-> **Score C 加入後 AUC 從 0.7233 → 0.7236（+0.0003），效應接近 0**。詳見 §五 與 §七 — 這是一個經過驗證的負面結果，跨隊 sum × sum 交互在本資料集上與 B + Δpm 高度共線，不提供獨立預測訊號，但**保留為解釋性產出**（`cross_team_pairs.csv` 列出 31 個非零 L1 係數，可用於 demo / 報告中的「跨隊技能克制」敘事）。
+> **Score C 加入後仍幾乎不提升 AUC**。新版 A+B+Δpm 與 A+B+C+Δpm 都是 0.7280；Score C 保留為解釋性產出（`cross_team_pairs.csv` 列出 31 個非零 L1 係數），不是主要預測來源。
 
 ---
 
@@ -36,18 +82,20 @@ P(home wins) = σ(0.348·ΔA + 0.176·ΔB − 0.023·C + 0.319·Δpm + 0.119·is
 | 1 | **Train/Test 切分** | 時序切分：train = 4 個賽季、test = 2024-25。同時解決提案 §5.3 時序洩漏。 | [score_ab.py:39-40](score_ab.py#L39-L40) |
 | 2 | **樣本對齊** | 兩模型 inner join 同一批 `game_id`。11,910 team-games 全對齊。 | [score_ab.py:178-181](score_ab.py#L178-L181) |
 | 3 | **`is_home` 旗標** | 不放進 Score 計算（保持對稱），改放到 final layer 當獨立特徵。`γ` 就是主場優勢。 | [score_ab.py:262-268, 284-285](score_ab.py#L284) |
-| 4 | **In-sample bias**（新發現 ⚠️） | **OOF 5-fold** 產生 train 的 Score → final layer 看到的訓練 Score 跟 test set 同等級。同時用 train statistics 做 **z-score 標準化**。 | [score_ab.py:117-145](score_ab.py#L117-L145), [score_ab.py:222-241](score_ab.py#L222-L241), [score_ab.py:280-289](score_ab.py#L280-L289) |
+| 4 | **In-sample bias**（新發現 ⚠️） | **Time-aware OOF 5-fold** 產生 train 的 Score → final layer 看到的訓練 Score 跟 test set 同等級。同時用 train statistics 做 **z-score 標準化**。 | [score_ab.py](score_ab.py) |
+| 5 | **P80 threshold leakage** | Score B 的 P80 dummy 在每個 OOF fold 內只用 train split 重算；test season 使用訓練期最新 threshold fallback。 | [score_ab.py](score_ab.py) |
 
 ### 為什麼問題 #4 是隱藏陷阱
 
-第一版實作 train AUC 看起來合理，但 test AUC 比單獨模型還差，且 β 係數為 **負**：
+以下表格保留第一版 debugging 歷程；最新版結果請以上方 demo-ready revision 為準。
 
 | 階段 | α | β | γ | δ(pm) | ζ(C) | Test AUC |
 |---|---:|---:|---:|---:|---:|---:|
 | 初版（無 OOF、無標準化） | +1.241 | **−0.613** ⚠️ | +0.139 | —— | —— | 0.6441 |
 | + OOF + 標準化 | +0.541 | +0.220 | +0.118 | —— | —— | 0.6922 |
 | + 36 內部交乘 + Δpm | +0.345 | +0.171 | +0.119 | +0.320 | —— | 0.7233 |
-| **+ Score C (81 跨隊 + L1)（最終）** | +0.348 | +0.176 | +0.119 | +0.319 | **−0.023** | **0.7236** |
+| + Score C (81 跨隊 + L1)（前版） | +0.348 | +0.176 | +0.119 | +0.319 | **−0.023** | **0.7236** |
+| **+ L1 Score B + time-aware OOF + fold 內 P80（新版）** | +0.1885 | +0.1810 | +0.1280 | +0.4818 | **−0.0179** | **0.7280** |
 
 原因：Score 在 train 是 in-sample fit（精度過高），在 test 是 out-of-sample（有泛化誤差）。final logit 對著兩個分布完全不同的訊號學係數，會把第二個 Score 推到負值來「修正」第一個 Score 在 train 上的 overshoot。OOF 預測讓兩邊分布一致就解了。
 
@@ -67,9 +115,9 @@ P(home wins) = σ(0.348·ΔA + 0.176·ΔB − 0.023·C + 0.319·Δpm + 0.119·is
 ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
 │ per-player XGB   │  │ 9 stats → 賽季    │  │ B 的 sum 特徵     │
 │ sample_w=min     │  │   P80 dummy      │  │ → 9×9 跨隊        │
-│ OOF 5-fold train │  │ team max + sum   │  │   sum×sum 交乘    │
+│ time-aware OOF   │  │ team max + sum   │  │   sum×sum 交乘    │
 │ refit-all test   │  │ 36 內部交乘       │  │ Pipeline:        │
-│ + SHAP (margin)  │  │ OOF 5-fold logit │  │   Std → L1 logit │
+│ + SHAP (margin)  │  │ time-aware L1    │  │   Std → L1 logit │
 │ Σ player SHAP →  │  │ refit-all test   │  │   (CV 選 C)       │
 │   Score_A        │  │ decision_func →  │  │ refit-all test   │
 │   team-game      │  │   Score_B        │  │ decision_func →  │
@@ -143,7 +191,7 @@ team-game 總和直接加進 final layer，**保留 σ 的對稱性**。
 
 ### 5.1 Dummy 生成
 
-對 9 個 rolling 指標，按賽季取 P80 閾值：
+對 9 個 rolling 指標，按賽季取 P80 閾值。新版 OOF 會在每個 fold 的 train split 內重算 threshold，避免 validation fold 資訊洩漏：
 
 ```python
 DUMMY_STATS = ["pts_roll10", "ast_roll10", "reb_roll10",
@@ -176,8 +224,9 @@ x_{d_fg3m_d_blk}  = T_3pt^depth × T_blk^depth    # 射手 × 護框
 
 ### 5.4 訓練
 
-- LogisticRegression(C=1.0, max_iter=2000) + L2
-- 5-fold OOF 產生 train 的 Score_B
+- `StandardScaler + LogisticRegressionCV(penalty="l1")`
+- Time-aware 5-fold OOF 產生 train 的 Score_B
+- Full train refit 後，54 個 Output B features 保留 13 個非零係數
 - 用全部 train 重 fit 後對 test 預測
 - 輸出 `decision_function`（logit value，與 Score_A margin-space 同尺度）
 
@@ -212,22 +261,22 @@ for h_skill in DUMMY_STATS:
 | 標籤 | home_win |
 | 模型 | `Pipeline(StandardScaler → LogisticRegressionCV)`，penalty=L1, solver=saga |
 | 正則化 | LogisticRegressionCV 從 `np.logspace(-3, 1, 20)` 自動掃 C（內 5-fold） |
-| OOF | 5-fold（同 A/B），train-side score_C 為 out-of-sample |
+| OOF | Time-aware 5-fold（同 A/B），train-side score_C 為 out-of-sample |
 | 結果 | L1 保留 **31/81** 特徵，最佳 C ≈ 0.0785 |
 
 Score C **不做差** — 81 個跨隊交乘本身已是 matchup-level，有方向性，直接進 final layer。
 
 ### 5-B.4 結果（負面 — 但有意義）
 
-`ζ = −0.023`（標準化後），AUC 從 0.7233 → 0.7236（+0.0003）。
+新版 `ζ = −0.0179`（標準化後），A+B+Δpm 和 A+B+C+Δpm 的 hold-out AUC 都是 0.7280。
 
 **含意**：
 
 | 觀察 | 解讀 |
 |---|---|
-| Score C only AUC = 0.5724（baseline 0.5445） | 跨隊交乘**單獨**只有 +0.028 AUC，幾乎是噪音 |
+| Score C only AUC = 0.5832（baseline 0.5445） | 跨隊交乘**單獨**只有有限訊號 |
 | 加入 Score C 後 ζ 微負 | 不是 leak（OOF 已防），是 final layer 對 C 殘餘噪音做小幅校正 |
-| B + Δpm = 0.7259 > B + C + Δpm = 0.7259（持平） | C 在 B+Δpm 之上**完全沒有獨立貢獻** |
+| B + Δpm = 0.7264，B + C + Δpm = 0.7262（近乎持平） | C 在 B+Δpm 之上**幾乎沒有獨立貢獻** |
 | L1 保留 31 個特徵 | 抓到一些有方向的對子，但訊號太弱無法影響大局 |
 
 **為什麼會這樣**：
@@ -275,30 +324,31 @@ Score C **不做差** — 81 個跨隊交乘本身已是 matchup-level，有方�
 |---|---:|---:|---|
 | Baseline（永遠 home win） | 0.5445 | — | 無模型 |
 | Score_A only + is_home | 0.6661 | +0.122 | 個人強度 |
-| Score_B only + is_home | 0.6494 | +0.105 | 陣容互補 |
-| Score_C only + is_home | 0.5724 | +0.028 | 跨隊交互（**幾乎無訊號**） |
+| Score_B only + is_home | 0.6624 | +0.118 | 陣容互補（新版 L1） |
+| Score_C only + is_home | 0.5832 | +0.039 | 跨隊交互（單獨訊號有限） |
 | **Δpm only + is_home** | **0.7164** | **+0.172** | 最強單一訊號 |
-| A + B + is_home | 0.6864 | +0.142 | 提案原版（無 Δpm） |
-| A + Δpm + is_home | 0.7175 | +0.173 | |
-| B + Δpm + is_home | 0.7259 | +0.181 | |
-| A + B + Δpm + is_home | 0.7233 | +0.179 | 上一版「完整」 |
-| A + C + Δpm + is_home | 0.7179 | +0.173 | C 不替代 B |
-| B + C + Δpm + is_home | 0.7259 | +0.181 | C 不疊加於 B（持平） |
-| **A + B + C + Δpm + is_home（最終）** | **0.7236** | **+0.179** | **採用** |
+| A + B + is_home | 0.6941 | +0.150 | 提案原版（無 Δpm） |
+| A + Δpm + is_home | 0.7211 | +0.177 | |
+| B + Δpm + is_home | 0.7264 | +0.182 | |
+| A + B + Δpm + is_home | 0.7280 | +0.184 | C 以外的主力組合 |
+| A + C + Δpm + is_home | 0.7212 | +0.177 | C 不替代 B |
+| B + C + Δpm + is_home | 0.7262 | +0.182 | C 不疊加於 B（近乎持平） |
+| **A + B + C + Δpm + is_home（最終）** | **0.7280** | **+0.184** | **採用** |
 
 ### 重要發現
 
 **1. Δpm 部分吸收了 Score_A 的預測力**：
-- B + Δpm（無 A）= 0.7259
-- A + B + Δpm（有 A）= 0.7233
-- 差距 0.003 在 1,225 樣本下不顯著
+- B + Δpm（無 A）= 0.7264
+- A + B + Δpm（有 A）= 0.7280
+- 新版加入 Score_A 後小幅提升 0.0016，表示 Score_A 仍有邊際訊號，但主要 power 仍在 Δpm
 
 → Score_A 與 Δpm 高度共線（兩者都在量「球員整體強度」）
 
 **2. Score C 與 B + Δpm 完全共線（新發現）**：
-- B + Δpm（無 C）= 0.7259
-- B + C + Δpm（有 C）= 0.7259
-- C 提供的「跨隊技能交互」訊號**已完全被 B（同隊內部組合）+ Δpm（隊伍歷史強度）吸收**
+- B + Δpm（無 C）= 0.7264
+- B + C + Δpm（有 C）= 0.7262
+- A + B + Δpm = 0.7280；A + B + C + Δpm = 0.7280
+- C 提供的「跨隊技能交互」訊號大多已被 B（同隊內部組合）+ Δpm（隊伍歷史強度）吸收
 
 → 跨隊 sum × sum 在 NBA 賽季粒度下**沒有獨立預測力**。詳見 §五-B。
 

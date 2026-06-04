@@ -4,6 +4,8 @@
 > 驗證範圍：`nba_data/` 內 5 份 CSV 是否足以支撐 **Output B（陣容技能互補 Logistic Regression）** 的完整訓練流程
 > 結論：**✅ 資料完全足以執行 Logit / Output B**，並已用 toy pipeline 端到端跑通驗證。
 
+> 最新狀態：這份文件是「資料可行性」附錄，裡面的 toy logit / L2 結果只用來證明資料能跑通。正式 demo-ready 模型已改成 Output B L1、time-aware OOF、fold 內 P80 threshold，最新指標請看 [`README.md`](README.md) 或 [`PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md) 的最新更新區塊。
+
 ---
 
 ## 一、資料盤點

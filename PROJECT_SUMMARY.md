@@ -6,17 +6,58 @@
 
 ---
 
+## 最新 demo-ready 更新（2026-06-04）
+
+這份總結原本記錄的是 Design B/C 第一版結果。demo 前已完成一輪修正並重新訓練，目前以此區塊為最新狀態：
+
+| 指標 | 最新數值 | 備註 |
+|---|---:|---|
+| **Test AUC**（2024-25 hold-out, 1,225 場）| **0.7280** | 較前版約 0.7236 上升 |
+| **Test Accuracy** | **0.6759** | 0.5 threshold 下略降 |
+| Final train matchups | 3,935 | Time-aware OOF 後只使用有 OOF score 的訓練段 |
+| Output B L1 survivors | 13 / 54 | 稀疏化 lineup 交乘雜訊 |
+| Output C L1 survivors | 31 / 81 | 保留跨隊技能敘事，但預測權重很小 |
+
+最新 final layer：
+
+```
+P(home wins) = σ(0.1885·ΔA + 0.1810·ΔB − 0.0179·C
+                 + 0.4818·Δpm + 0.1280·is_home + 0.1290)
+```
+
+Demo 前主要修正：
+
+1. **Score B 改用 L1 LogisticRegressionCV**，54 個 lineup features 只留下 13 個，避免 rare interaction noise。
+2. **OOF 改成 time-aware split**，不再用 random fold 混合同季未來比賽。
+3. **P80 threshold 移到 fold 內計算**，避免驗證 fold 的分位數資訊洩漏到訓練。
+4. **推論層補上 Score C**，`predict_lineup.py` 現在和 `final_feature_order = [delta_A, delta_B, score_C, delta_pm, is_home]` 對齊。
+5. **新增 `symmetric=True`**，用 forward/reverse logit 做中性場強弱比較。
+6. **新增 calibration 診斷輸出**：[`outputs/calibration_buckets.csv`](outputs/calibration_buckets.csv)、[`outputs/calibration_bucket_045_050.csv`](outputs/calibration_bucket_045_050.csv)。
+
+最新 ablation 摘要：
+
+| 組合 | Test AUC |
+|---|---:|
+| Δpm only + is_home | 0.7164 |
+| B + Δpm + is_home | 0.7264 |
+| A + B + Δpm + is_home | 0.7280 |
+| A + B + C + Δpm + is_home | 0.7280 |
+
+結論：新版排序能力更好（AUC 0.7280），但 Accuracy 略降，代表後續可針對 threshold / calibration 繼續調整。Score C 的預測貢獻仍接近 0，但可保留為跨隊技能克制的解釋素材。
+
+---
+
 ## 0. TL;DR
 
 我們建了一個可以「輸入任意 N 名球員 → 輸出勝率 + 球員級貢獻分解」的 NBA 對戰預測系統。
 
 | 指標 | 數值 | 對標 |
 |---|---:|---|
-| **Test AUC**（2024-25 hold-out, 1,225 場）| **0.7233** | 538 ~0.72，Vegas 0.72-0.74 |
-| **Test Accuracy** | **0.6776** | 538 0.67-0.69，Vegas 0.67-0.70 |
+| **Test AUC**（2024-25 hold-out, 1,225 場）| **0.7280** | 538 ~0.72，Vegas 0.72-0.74 |
+| **Test Accuracy** | **0.6759** | 538 0.67-0.69，Vegas 0.67-0.70 |
 | P_home_win 範圍 | 0.137 ~ 0.925 | spread 接近 Vegas |
 | Calibration（最高 bucket 預測 vs 實際） | 0.766 / 0.790 | 幾乎完美 |
-| 訓練資料 | 4,722 場（2020-21 ~ 2023-24） | 全 NBA 5 個賽季 |
+| 訓練資料 | 3,935 final-layer matchups（2020-21 ~ 2023-24 time-aware OOF 後） | 全 NBA 5 個賽季 |
 
 **三個核心能力**：
 1. 對任意 N 名球員的對決即時預測勝率
@@ -41,9 +82,9 @@
 ┌─────────────────────┐               ┌─────────────────────┐
 │ per-player XGBoost  │               │ 9 stats → 賽季 P80   │
 │ sample_weight=min   │               │   dummy 二值化       │
-│ OOF 5-fold (train)  │               │ team 聚合: max + sum │
+│ time-aware OOF train│               │ team 聚合: max + sum │
 │ refit-all (test)    │               │ 36 對 sum×sum 交乘   │
-│ + TreeExplainer SHAP│               │ OOF 5-fold logit     │
+│ + TreeExplainer SHAP│               │ time-aware L1 logit  │
 │ Σ player SHAP →     │               │ refit-all            │
 │   Score_A per team  │               │ decision_function →  │
 └─────────┬───────────┘               │   Score_B per team   │
@@ -68,21 +109,22 @@
               └─────────────────────────────────────┘
 ```
 
-### 1.2 最終訓練係數
+### 1.2 最新 final layer 係數
 
 ```
-P(home wins) = σ(0.345·ΔA + 0.171·ΔB + 0.320·Δpm + 0.119·is_home + 0.120)
+P(home wins) = σ(0.1885·ΔA + 0.1810·ΔB − 0.0179·C + 0.4818·Δpm + 0.1280·is_home + 0.1290)
 ```
 
 | 係數 | 值 | 意義 |
 |---|---:|---|
-| α | +0.345 | 個人強度權重（per-player SHAP Σ） |
-| β | +0.171 | 陣容互補權重（max/sum dummies + 36 交乘）|
-| δ | +0.320 | 歷史強度權重（隊伍滾動 plus_minus 平均）|
-| γ | +0.119 | 主場優勢 — 對應約 σ(0.12)≈53% |
-| intercept | +0.120 | base rate |
+| α | +0.1885 | 個人強度權重（per-player SHAP Σ） |
+| β | +0.1810 | 陣容互補權重（max/sum dummies + 36 交乘，L1 稀疏化）|
+| ζ | −0.0179 | 跨隊技能交互權重（Score C，預測貢獻很小）|
+| δ | +0.4818 | 歷史強度權重（隊伍滾動 plus_minus 平均）|
+| γ | +0.1280 | 主場優勢 |
+| intercept | +0.1290 | base rate |
 
-**全部正號**，無共線性導致的方向反轉。可解釋的 final layer 確保決策透明。
+除 Score C 的小幅負係數外，主要訊號方向符合直覺；可解釋的 final layer 確保決策透明。
 
 ### 1.3 為什麼這樣設計
 
@@ -93,7 +135,8 @@ P(home wins) = σ(0.345·ΔA + 0.171·ΔB + 0.320·Δpm + 0.119·is_home + 0.120
 | 將 `plus_minus_roll10` 改用 team-mean Δpm 放 final layer | 保留訊號，避免個人歸因失真 |
 | Logit + 36 交乘項（Output B） | 提案 §3 指定，捕捉跨球員技能互補 |
 | z-score 標準化 ΔA/ΔB/Δpm | 三者量綱差異大（std 1.27 / 0.47 / 5+），不標準化 final logit 會偏到 ΔA |
-| OOF 5-fold 產生 train 的 Score | **修隱藏 in-sample bias**（initial β 變負是此問題的徵兆）|
+| Time-aware OOF 5-fold 產生 train 的 Score | **修隱藏 in-sample bias**，並避免同季未來比賽進入驗證 fold |
+| Fold 內重算 P80 threshold | 避免 Output B 的 validation fold 分位數資訊洩漏 |
 | 時序切分 train/test | 防止跨季洩漏（提案 §5.3） |
 
 ---
@@ -199,7 +242,8 @@ std   = 0.154
 | 1 | **Train/Test 切分** | 時序切分（train = 2020-21~2023-24, test = 2024-25），同時防跨季洩漏 |
 | 2 | **樣本對齊** | 兩模型 inner join 同 `game_id`，11,910 team-games 全對齊 |
 | 3 | **`is_home` 旗標** | 不放進 Score 計算（保持對稱），放 final layer 當獨立特徵 |
-| 4 | **In-sample bias**（隱藏陷阱）| **OOF 5-fold** + **z-score 標準化**（用 train 統計值）|
+| 4 | **In-sample bias**（隱藏陷阱）| **Time-aware OOF 5-fold** + **z-score 標準化**（用 train 統計值）|
+| 5 | **P80 threshold leakage** | P80 threshold 改在每個 OOF fold 的 train split 內重算 |
 
 ### 第 4 個對齊問題的關鍵性
 
@@ -207,7 +251,8 @@ std   = 0.154
 |---|---:|---:|---:|---:|---:|
 | 初版（無 OOF、無標準化）| +1.241 | **−0.613** ⚠️ | +0.139 | —— | 0.6441 |
 | + OOF + 標準化 | +0.541 | +0.220 | +0.118 | —— | 0.6922 |
-| + 36 交乘 + Δpm（最終）| +0.345 | +0.171 | +0.119 | +0.320 | **0.7233** |
+| + 36 交乘 + Δpm（前版）| +0.345 | +0.171 | +0.119 | +0.320 | **0.7233** |
+| + L1 Score B + time-aware OOF + fold 內 P80（新版）| +0.1885 | +0.1810 | +0.1280 | +0.4818 | **0.7280** |
 
 β 一開始是負的，因為 Score 在 train 是 in-sample（過度精確）、在 test 是 out-of-sample。final logit 用差異分布訓練，會把另一個 Score 推到負值補正。**OOF 修這個就解決了。**
 
@@ -219,12 +264,13 @@ std   = 0.154
 
 | 案例 | 設定 | P(home wins) | 備註 |
 |---|---|---:|---|
-| **A** | LAL vs BOS @ 2025-03-01 | 0.576 | 強強對決，自然接近 50% |
-| **A2** | OKC vs WAS @ 2025-03-01 | **0.774** | 西冠 vs 墊底，Δpm=+2.50 σ 拉開 spread |
-| **B** | A 但 LeBron→Dončić | 0.547 | -2.8pp，個人替換的量化影響 |
-| **C** | A 但 is_home=0 | 0.546 | 主場優勢 +2.9pp |
-| **D** | A 但 7v7 加板凳 | 0.534 | 板凳稀釋頂尖球員影響 |
-| **E** | 2020-21 LAL vs 2020-21 BOS | 0.556 | 跨時空 LeBron SHAP: 2021=+0.40, 2025=+0.60 |
+| **A** | LAL vs BOS @ 2025-03-01 | 0.594 | 強強對決，自然接近 50% |
+| **A2** | OKC vs WAS @ 2025-03-01 | **0.830** | 強隊 vs 弱隊，Δpm=+2.47 σ 拉開 spread |
+| **B** | A 但 LeBron→Dončić | 0.562 | -3.2pp，個人替換的量化影響 |
+| **C** | A 但 is_home=0 | 0.563 | 主場係數影響 +3.1pp |
+| **C2** | A 但 `symmetric=True` | 0.531 | 中性場強弱比較；反向相加約 1.0006 |
+| **D** | A 但 7v7 加板凳 | 0.543 | 任意 N 人輸入；板凳會改變整隊聚合訊號 |
+| **E** | 2020-21 LAL 快照查詢 | 0.515 | 跨時空 SHAP 是 context-dependent，不解讀成純個人 aging |
 
 ### 5.2 案例 A 的 SHAP 分解（log-odds）
 
@@ -261,7 +307,9 @@ Kristaps Porziņģis  -0.096
 | 跨季 lineup 比較 | 不同 `snapshot_date` | 巔峰 LeBron vs 現在 |
 | MVP 個人貢獻拆解 | `per_player_shap_home/away` | LLM 報告素材 |
 
-### 6.2 實例：LAL 想換掉 D'Angelo Russell，6 個候選 vs BOS
+### 6.2 實例：LAL 想換掉 D'Angelo Russell，6 個候選 vs BOS（歷史 exploratory scan）
+
+> 這張表是前版 exploratory what-if scan，用來展示決策支援形式；最新版 demo notebook 的 LeBron→Dončić swap 結果是 0.594 → 0.562（-3.2pp）。正式展示請以 [`demo.ipynb`](demo.ipynb) 為準。
 
 | 候選人 | P(LAL wins) | Δ vs baseline | 他的 SHAP | Score_A | Score_B | pm_home |
 |---|---:|---:|---:|---:|---:|---:|
@@ -309,8 +357,8 @@ python3 -m venv .venv
 執行流程（約 80 秒 on M1）：
 1. 讀取 5 份 CSV
 2. 建 per-player 訓練樣本（83,640 rows）
-3. Output A 5-fold OOF XGBoost + SHAP（~60 秒）
-4. Output B dummy 二值化 + 36 交乘項 + OOF logit（~3 秒）
+3. Output A time-aware 5-fold OOF XGBoost + SHAP（~60 秒）
+4. Output B fold 內 P80 dummy + 36 交乘項 + time-aware L1 OOF logit
 5. Δpm team-mean 聚合
 6. Final calibration logit + ablation
 7. 儲存所有模型 → [`outputs/models/`](outputs/models/)
@@ -331,7 +379,7 @@ away_ids = [find_player(n) for n in
 # 預測（可指定快照日期，None 表示用每位球員最新一筆）
 result = predict_matchup(home_ids, away_ids, snapshot_date="2025-03-01")
 
-print(result["P_home_win"])                     # 0.576
+print(result["P_home_win"])                     # 0.594 in current demo
 print(result["per_player_shap_home"])           # 球員級貢獻
 print(result["logit_contributions"])            # 維度級分解
 summary_table(result)                           # one-row 表格
@@ -444,9 +492,10 @@ nba-lineup-predictor/
 
 | 項目 | 嚴重度 | 工作量 |
 |---|---|---|
-| **對稱性** — 中性場 `P(A vs B) + P(B vs A) = 1.06 ≠ 1.0` | 低（影響排序），原因是訓練資料 home_win 框架的 intercept 殘留 | 強制 `fit_intercept=False` 或 augment 鏡像樣本 |
-| Score_A 與 Δpm 部分共線（B+Δpm AUC 0.7259 略高於 A+B+Δpm 0.7233）| 低（差距不顯著）| 接受或殘差化 |
-| Score_B 36 交乘擴張後單獨 AUC 略降（0.6653→0.6494）| 低 | L1 自動選稀疏交乘 |
+| **對稱性** — 中性場強弱比較需要 `P(A>B)+P(B>A)≈1` | 已處理 | `predict_matchup(..., symmetric=True)` 用 forward/reverse logit 反對稱化；demo 約 1.0006 |
+| Score_A 與 Δpm 部分共線 | 中 | 新版 A+B+Δpm AUC 0.7280，仍可考慮殘差化或 on/off net rating |
+| Score_B 36 交乘有 rare interaction noise | 已處理 | 改用 L1，自動選出 13/54 個非零特徵 |
+| 0.45-0.50 calibration bucket 偏弱 | 中 | 已輸出 `outputs/calibration_bucket_045_050.csv` 供後續診斷 |
 
 ### 9.2 提案剩餘 phase
 
@@ -491,7 +540,7 @@ For each player i in team T:
 Score_A(T) = Σ_{i ∈ T} player_contribution_i
 ```
 
-訓練：sample_weight = `min_roll10`；OOF 5-fold + refit-all
+訓練：sample_weight = `min_roll10`；time-aware OOF 5-fold + refit-all
 
 ### Output B — Score B（per team）
 
@@ -509,7 +558,7 @@ feature_vec = [T_*^max (9), T_*^sum (9), interactions (36)]     # 54 dims
 Score_B(T) = w · feature_vec + b₀     # logit decision_function
 ```
 
-訓練：L2 (C=1.0)；OOF 5-fold + refit-all
+訓練：`StandardScaler + LogisticRegressionCV(penalty="l1")`；time-aware OOF 5-fold + refit-all；新版保留 13/54 個非零特徵
 
 ### Δpm（per team）
 
@@ -553,9 +602,9 @@ libomp 22.1.6 (brew install libomp)
 
 | 階段 | 時間 |
 |---|---|
-| Output A 5-fold OOF XGB + SHAP | ~60 秒 |
+| Output A time-aware 5-fold OOF XGB + SHAP | ~60 秒 |
 | Output A 全 train refit + test SHAP | ~15 秒 |
-| Output B 5-fold OOF logit | ~3 秒 |
+| Output B time-aware 5-fold OOF L1 logit | ~數十秒 |
 | Final layer + ablation + 儲存 artifacts | < 2 秒 |
 | **Total** | **~80 秒** |
 
