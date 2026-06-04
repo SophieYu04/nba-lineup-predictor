@@ -29,7 +29,7 @@ import shap
 import xgboost as xgb
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
-from sklearn.model_selection import KFold
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -63,6 +63,73 @@ DUMMY_STATS = [
     "stl_roll10", "blk_roll10", "fg3m_roll10",
     "true_shooting_roll10", "usage_proxy_roll10", "def_impact_roll10",
 ]
+
+
+def ordered_game_ids(frame: pd.DataFrame) -> np.ndarray:
+    """Return game ids ordered by date so OOF folds respect time."""
+    return (
+        frame[["game_id", "game_date"]]
+        .drop_duplicates()
+        .sort_values(["game_date", "game_id"])["game_id"]
+        .to_numpy()
+    )
+
+
+def compute_p80_thresholds(frame: pd.DataFrame) -> pd.DataFrame:
+    return (
+        frame.groupby("season")[DUMMY_STATS]
+        .quantile(0.80)
+        .reset_index()
+        .sort_values("season")
+        .reset_index(drop=True)
+    )
+
+
+def add_p80_dummies(frame: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
+    """Apply train-only P80 thresholds; unseen future seasons use latest known season."""
+    out = frame.copy()
+    threshold_map = thresholds.set_index("season")
+    latest = threshold_map.iloc[-1]
+    for c in DUMMY_STATS:
+        row_thresholds = out["season"].map(threshold_map[c]).fillna(latest[c])
+        out[f"d_{c}"] = (out[c] > row_thresholds).astype(int)
+    return out
+
+
+def build_team_dummy_features(frame: pd.DataFrame, thresholds: pd.DataFrame) -> pd.DataFrame:
+    dummy_src = add_p80_dummies(frame.dropna(subset=DUMMY_STATS), thresholds)
+    dummy_cols = [f"d_{c}" for c in DUMMY_STATS]
+
+    agg = (
+        dummy_src
+        .groupby(["game_id", "team"])[dummy_cols]
+        .agg(["max", "sum"])
+    )
+    agg.columns = [f"{a}_{b}" for a, b in agg.columns]
+    agg = agg.reset_index()
+
+    all_dummies = [f"d_{c}" for c in DUMMY_STATS]
+    for i, a in enumerate(all_dummies):
+        for b in all_dummies[i + 1:]:
+            agg[f"x_{a}_{b}"] = agg[f"{a}_sum"] * agg[f"{b}_sum"]
+    return agg
+
+
+def build_logit_B():
+    # L1 lets weak/rare interaction terms drop instead of carrying shrunk noise.
+    return Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegressionCV(
+            Cs=np.logspace(-3, 1, 20),
+            penalty="l1",
+            solver="saga",
+            max_iter=5000,
+            cv=5,
+            scoring="roc_auc",
+            n_jobs=-1,
+            random_state=42,
+        )),
+    ])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -123,12 +190,12 @@ def build_xgb():
     )
 
 # OOF SHAP on training rows (so train-side Score_A reflects out-of-sample quality)
-train_game_ids = A_train["game_id"].unique()
-kf = KFold(n_splits=OOF_FOLDS, shuffle=True, random_state=42)
+train_game_ids = ordered_game_ids(A_train)
+tscv = TimeSeriesSplit(n_splits=OOF_FOLDS)
 A_train = A_train.reset_index(drop=True)
 A_train["shap_sum"] = np.nan
 
-for fold, (tr_g, va_g) in enumerate(kf.split(train_game_ids), 1):
+for fold, (tr_g, va_g) in enumerate(tscv.split(train_game_ids), 1):
     tr_games = set(train_game_ids[tr_g])
     va_games = set(train_game_ids[va_g])
     tr_idx = A_train.index[A_train["game_id"].isin(tr_games)]
@@ -153,9 +220,11 @@ xgb_clf.fit(
 explainer = shap.TreeExplainer(xgb_clf)
 shap_test = explainer.shap_values(A_test[feats_present])
 A_test["shap_sum"] = shap_test.sum(axis=1)
+A_train_scored = A_train.dropna(subset=["shap_sum"]).copy()
+print(f"  Score_A OOF coverage: {len(A_train_scored):,}/{len(A_train):,} train player rows")
 
 # Aggregate Σ SHAP per team-game = Score A
-score_A = (pd.concat([A_train, A_test])
+score_A = (pd.concat([A_train_scored, A_test])
            .groupby(["game_id", "team"])["shap_sum"]
            .sum()
            .reset_index()
@@ -163,7 +232,7 @@ score_A = (pd.concat([A_train, A_test])
 print(f"  Score_A team-games: {len(score_A):,}")
 
 # Also save per-player SHAP for explainability later
-per_player_shap = pd.concat([A_train, A_test])[
+per_player_shap = pd.concat([A_train_scored, A_test])[
     ["game_id", "game_date", "team", "player_id", "player_name",
      "season", "min_roll10", "shap_sum"]
 ].rename(columns={"shap_sum": "player_shap"})
@@ -176,29 +245,16 @@ per_player_shap.to_csv(OUT / "player_shap.csv", index=False)
 print("[4] Building Output B lineup dummy features ...")
 
 dummy_src = rolling.dropna(subset=DUMMY_STATS).copy()
-# Season-wise P80 dummies
-for c in DUMMY_STATS:
-    dummy_src[f"d_{c}"] = (
-        dummy_src.groupby("season")[c]
-        .transform(lambda s: (s > s.quantile(0.80)).astype(int))
-    )
-
-dummy_cols = [f"d_{c}" for c in DUMMY_STATS]
-
-# Aggregate to team-game: max (有無) and sum (厚度)
-agg = (dummy_src
-       .groupby(["game_id", "team"])[dummy_cols]
-       .agg(["max", "sum"]))
-agg.columns = [f"{a}_{b}" for a, b in agg.columns]
-agg = agg.reset_index()
+dummy_train_src = dummy_src[dummy_src["season"].isin(TRAIN_SEASONS)].copy()
+dummy_test_src = dummy_src[dummy_src["season"].eq(TEST_SEASON)].copy()
+full_train_p80 = compute_p80_thresholds(dummy_train_src)
+agg_train_full = build_team_dummy_features(dummy_train_src, full_train_p80)
+agg_test = build_team_dummy_features(dummy_test_src, full_train_p80)
+agg = pd.concat([agg_train_full, agg_test], ignore_index=True)
 
 # Pairwise interaction terms — sum × sum for ALL 9 skill pairs (C(9,2) = 36)
-# L2 regularization (smaller C) handles overfitting from the larger feature space.
+# The model now uses L1 so rare/noisy interactions can drop out.
 ALL_DUMMIES = [f"d_{c}" for c in DUMMY_STATS]
-for i, a in enumerate(ALL_DUMMIES):
-    for b in ALL_DUMMIES[i + 1:]:
-        agg[f"x_{a}_{b}"] = agg[f"{a}_sum"] * agg[f"{b}_sum"]
-
 team_feat_cols_B = [c for c in agg.columns if c not in ("game_id", "team")]
 print(f"  Output B team-level features: {len(team_feat_cols_B)}")
 
@@ -217,30 +273,47 @@ print(f"[5] Aligned team-games: {len(common):,}  (A={len(games_A):,}, B={len(gam
 # ──────────────────────────────────────────────────────────────────────
 print("[6] Training Output B logit (OOF for train + single fit for test) ...")
 agg = agg.merge(labels, on=["game_id", "team"], how="inner")
-agg = agg.merge(games[["game_id", "season"]].drop_duplicates(),
+agg = agg.merge(games[["game_id", "season", "game_date"]].drop_duplicates(),
                 on="game_id", how="inner")
 
 B_train = agg[agg["season"].isin(TRAIN_SEASONS)].reset_index(drop=True)
 B_test  = agg[agg["season"].eq(TEST_SEASON)].reset_index(drop=True)
 
 B_train["score_B"] = np.nan
-train_game_ids_B = B_train["game_id"].unique()
-for fold, (tr_g, va_g) in enumerate(kf.split(train_game_ids_B), 1):
+train_game_ids_B = ordered_game_ids(B_train)
+for fold, (tr_g, va_g) in enumerate(tscv.split(train_game_ids_B), 1):
     tr_games = set(train_game_ids_B[tr_g])
     va_games = set(train_game_ids_B[va_g])
-    tr_idx = B_train.index[B_train["game_id"].isin(tr_games)]
-    va_idx = B_train.index[B_train["game_id"].isin(va_games)]
-    lg = LogisticRegression(C=1.0, max_iter=2000)
-    lg.fit(B_train.loc[tr_idx, team_feat_cols_B], B_train.loc[tr_idx, "team_win"])
-    B_train.loc[va_idx, "score_B"] = lg.decision_function(B_train.loc[va_idx, team_feat_cols_B])
+    fold_train_src = dummy_train_src[dummy_train_src["game_id"].isin(tr_games)]
+    fold_val_src = dummy_train_src[dummy_train_src["game_id"].isin(va_games)]
+    fold_p80 = compute_p80_thresholds(fold_train_src)
+    fold_train = build_team_dummy_features(fold_train_src, fold_p80)
+    fold_val = build_team_dummy_features(fold_val_src, fold_p80)
+    fold_train = fold_train.merge(labels, on=["game_id", "team"], how="inner")
+    fold_val = fold_val.merge(labels, on=["game_id", "team"], how="inner")
+
+    lg = build_logit_B()
+    lg.fit(fold_train[team_feat_cols_B], fold_train["team_win"])
+    val_scores = lg.decision_function(fold_val[team_feat_cols_B])
+    for (gid, team), score in zip(fold_val[["game_id", "team"]].itertuples(index=False, name=None), val_scores):
+        B_train.loc[
+            (B_train["game_id"].eq(gid)) & (B_train["team"].eq(team)),
+            "score_B",
+        ] = score
+    print(f"  fold {fold}/{OOF_FOLDS}: train {len(fold_train):,} → OOF {len(fold_val):,}")
 
 # Refit on full train for test prediction
-logit_B = LogisticRegression(C=1.0, max_iter=2000)
+logit_B = build_logit_B()
 logit_B.fit(B_train[team_feat_cols_B], B_train["team_win"])
 B_test["score_B"] = logit_B.decision_function(B_test[team_feat_cols_B])
+clf_B = logit_B.named_steps["clf"]
+nonzero_B = int((clf_B.coef_[0] != 0).sum())
+print(f"  L1 kept {nonzero_B}/{len(team_feat_cols_B)} Output B features  (C={clf_B.C_[0]:.4f})")
+B_train_scored = B_train.dropna(subset=["score_B"]).copy()
+print(f"  Score_B OOF coverage: {len(B_train_scored):,}/{len(B_train):,} train team-games")
 
 score_B = pd.concat([
-    B_train[["game_id", "team", "score_B"]],
+    B_train_scored[["game_id", "team", "score_B"]],
     B_test[["game_id", "team", "score_B"]],
 ], ignore_index=True)
 
@@ -276,7 +349,7 @@ away_sums = team_sums.rename(
     columns={"team": "away_team", **{c: f"a_{c}" for c in sum_cols}}
 )
 
-cross_frame = games[["game_id", "season", "home_team", "away_team", "home_win"]].copy()
+cross_frame = games[["game_id", "game_date", "season", "home_team", "away_team", "home_win"]].copy()
 cross_frame = cross_frame.merge(home_sums, on=["game_id", "home_team"], how="inner")
 cross_frame = cross_frame.merge(away_sums, on=["game_id", "away_team"], how="inner")
 
@@ -314,8 +387,8 @@ def build_logit_C():
 
 
 C_train["score_C_raw"] = np.nan
-train_game_ids_C = C_train["game_id"].unique()
-for fold, (tr_g, va_g) in enumerate(kf.split(train_game_ids_C), 1):
+train_game_ids_C = ordered_game_ids(C_train)
+for fold, (tr_g, va_g) in enumerate(tscv.split(train_game_ids_C), 1):
     tr_games = set(train_game_ids_C[tr_g])
     va_games = set(train_game_ids_C[va_g])
     tr_idx = C_train.index[C_train["game_id"].isin(tr_games)]
@@ -330,13 +403,15 @@ for fold, (tr_g, va_g) in enumerate(kf.split(train_game_ids_C), 1):
 logit_C = build_logit_C()
 logit_C.fit(C_train[c_feat_cols], C_train["home_win"])
 C_test["score_C_raw"] = logit_C.decision_function(C_test[c_feat_cols])
+C_train_scored = C_train.dropna(subset=["score_C_raw"]).copy()
+print(f"  Score_C OOF coverage: {len(C_train_scored):,}/{len(C_train):,} train matchups")
 
 clf_C = logit_C.named_steps["clf"]
 nonzero = int((clf_C.coef_[0] != 0).sum())
 print(f"  L1 kept {nonzero}/{len(c_feat_cols)} features  (C={clf_C.C_[0]:.4f})")
 
 score_C_all = pd.concat([
-    C_train[["game_id", "home_team", "away_team", "score_C_raw"]],
+    C_train_scored[["game_id", "home_team", "away_team", "score_C_raw"]],
     C_test[["game_id", "home_team", "away_team", "score_C_raw"]],
 ], ignore_index=True)
 
@@ -433,6 +508,31 @@ print(f"  AUC       : {roc_auc_score(y_test, P_test):.4f}")
 print(f"  Baseline  : {max(y_test.mean(), 1 - y_test.mean()):.4f}")
 print(classification_report(y_test, y_pred, digits=3))
 
+calibration_bins = [0.0, 0.30, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70, 1.0]
+calibration_labels = ["<0.30", "0.30-0.40", "0.40-0.45", "0.45-0.50",
+                      "0.50-0.55", "0.55-0.60", "0.60-0.70", ">0.70"]
+cal = M_test[["game_id", "game_date", "home_team", "away_team", "home_win"]].copy()
+cal["P_home_win"] = P_test
+cal["bucket"] = pd.cut(
+    cal["P_home_win"],
+    bins=calibration_bins,
+    labels=calibration_labels,
+    include_lowest=True,
+    right=False,
+)
+calibration_table = (
+    cal.groupby("bucket", observed=False)
+    .agg(n=("home_win", "size"),
+         avg_pred=("P_home_win", "mean"),
+         actual_home_win=("home_win", "mean"))
+    .reset_index()
+)
+calibration_table["gap_actual_minus_pred"] = (
+    calibration_table["actual_home_win"] - calibration_table["avg_pred"]
+)
+print("\n  Calibration by probability bucket:")
+print(calibration_table.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
 # Component ablations
 def auc_for_cols(cols):
     p = LogisticRegression(C=1.0, max_iter=1000).fit(
@@ -467,6 +567,11 @@ out_test = M_test[["game_id", "game_date", "home_team", "away_team",
 out_test["P_home_win"] = P_test
 out_test["pred_home_win"] = y_pred
 out_test.to_csv(OUT / "predictions_test.csv", index=False)
+calibration_table.to_csv(OUT / "calibration_buckets.csv", index=False)
+cal[cal["bucket"].eq("0.45-0.50")].to_csv(
+    OUT / "calibration_bucket_045_050.csv",
+    index=False,
+)
 
 with open(OUT / "final_weights.json", "w") as f:
     json.dump({
@@ -481,12 +586,15 @@ with open(OUT / "final_weights.json", "w") as f:
         "n_train_matchups": int(len(M_train)),
         "n_test_matchups": int(len(M_test)),
         "output_B_total_features": int(len(team_feat_cols_B)),
+        "output_B_l1_kept_features": int(nonzero_B),
         "output_B_interaction_pairs": int(len(ALL_DUMMIES) * (len(ALL_DUMMIES) - 1) // 2),
         "output_C_total_features": int(len(c_feat_cols)),
         "output_C_l1_kept_features": int(nonzero),
     }, f, indent=2)
 
 print(f"\n  Saved: {OUT / 'predictions_test.csv'}")
+print(f"  Saved: {OUT / 'calibration_buckets.csv'}")
+print(f"  Saved: {OUT / 'calibration_bucket_045_050.csv'}")
 print(f"  Saved: {OUT / 'player_shap.csv'}")
 print(f"  Saved: {OUT / 'final_weights.json'}")
 
@@ -499,12 +607,7 @@ MODELS = OUT / "models"
 MODELS.mkdir(exist_ok=True)
 
 # Per-season P80 thresholds used to binarize Output B dummies at inference
-p80_thresholds = (
-    dummy_src.groupby("season")[DUMMY_STATS]
-    .quantile(0.80)
-    .reset_index()
-)
-p80_thresholds.to_csv(MODELS / "p80_thresholds.csv", index=False)
+full_train_p80.to_csv(MODELS / "p80_thresholds.csv", index=False)
 
 # Save fitted artifacts via joblib
 joblib.dump(xgb_clf,    MODELS / "xgb_output_A.joblib")

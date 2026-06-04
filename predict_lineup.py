@@ -48,9 +48,11 @@ class _Artifacts:
             return
         cls.xgb_clf   = joblib.load(MODELS / "xgb_output_A.joblib")
         cls.logit_B   = joblib.load(MODELS / "logit_output_B.joblib")
+        cls.logit_C   = joblib.load(MODELS / "logit_output_C.joblib")
         cls.final_clf = joblib.load(MODELS / "final_logit.joblib")
         cls.scaler_A  = joblib.load(MODELS / "scaler_A.joblib")
         cls.scaler_B  = joblib.load(MODELS / "scaler_B.joblib")
+        cls.scaler_C  = joblib.load(MODELS / "scaler_C.joblib")
         cls.scaler_pm = joblib.load(MODELS / "scaler_pm.joblib")
         with open(MODELS / "feature_meta.json") as f:
             cls.meta = json.load(f)
@@ -157,6 +159,7 @@ def _score_team(snapshot: pd.DataFrame, season_for_p80: str) -> dict:
         "score_A": score_A,
         "score_B": score_B,
         "team_pm": team_pm,
+        "dummy_sums": agg_sum,
         "per_player_shap": pd.DataFrame({
             "player_id": snapshot["player_id"].astype(int).values,
             "player_name": snapshot["player_name"].values,
@@ -167,6 +170,26 @@ def _score_team(snapshot: pd.DataFrame, season_for_p80: str) -> dict:
     }
 
 
+def _score_cross_team(home: dict, away: dict) -> tuple[float, float]:
+    """Compute directional Score_C for home skill sums vs away skill sums."""
+    A = _Artifacts
+    dummy_stats = A.meta["output_B_dummy_stats"]
+    row = {}
+    for h_skill in dummy_stats:
+        for a_skill in dummy_stats:
+            row[f"c_h_{h_skill}_a_{a_skill}"] = (
+                home["dummy_sums"][f"d_{h_skill}_sum"]
+                * away["dummy_sums"][f"d_{a_skill}_sum"]
+            )
+
+    X_C = pd.DataFrame([row]).reindex(columns=A.meta["output_C_features"]).fillna(0)
+    score_C_raw = float(A.logit_C.decision_function(X_C)[0])
+    score_C = float(A.scaler_C.transform(
+        pd.DataFrame({"score_C_raw": [score_C_raw]})
+    )[0, 0])
+    return score_C_raw, score_C
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────
@@ -175,6 +198,7 @@ def predict_matchup(
     away_player_ids: Iterable[int],
     snapshot_date: str | pd.Timestamp | None = None,
     is_home: int = 1,
+    symmetric: bool = False,
 ) -> dict:
     """Predict P(home wins) for an arbitrary lineup matchup.
 
@@ -187,6 +211,9 @@ def predict_matchup(
         If None, uses each player's most recent available game.
     is_home : int, default 1
         Set to 0 for "neutral floor" hypothetical (drops home-court factor).
+    symmetric : bool, default False
+        For neutral strength comparisons, remove intercept and home-court offset
+        so swapping the two sides gives complementary probabilities.
 
     Returns
     -------
@@ -213,6 +240,8 @@ def predict_matchup(
 
     home = _score_team(snap_h, season_for_p80)
     away = _score_team(snap_a, season_for_p80)
+    score_C_raw, score_C = _score_cross_team(home, away)
+    score_C_reverse_raw, score_C_reverse = _score_cross_team(away, home)
 
     delta_A_raw = home["score_A"] - away["score_A"]
     delta_B_raw = home["score_B"] - away["score_B"]
@@ -223,22 +252,63 @@ def predict_matchup(
     delta_B  = float(A.scaler_B.transform(pd.DataFrame({"delta_B_raw":  [delta_B_raw]}))[0, 0])
     delta_pm = float(A.scaler_pm.transform(pd.DataFrame({"delta_pm_raw":[delta_pm_raw]}))[0, 0])
 
+    final_values = {
+        "delta_A": delta_A,
+        "delta_B": delta_B,
+        "score_C": score_C,
+        "delta_pm": delta_pm,
+        "is_home": is_home,
+    }
     final_x = pd.DataFrame(
-        [[delta_A, delta_B, delta_pm, is_home]],
+        [[final_values[c] for c in A.meta["final_feature_order"]]],
         columns=A.meta["final_feature_order"],
     )
-    P_home = float(A.final_clf.predict_proba(final_x)[0, 1])
+    logit = float(A.final_clf.decision_function(final_x)[0])
+    if symmetric:
+        coef_by_feature = dict(zip(A.meta["final_feature_order"], A.final_clf.coef_[0]))
+        reverse_values = {
+            "delta_A": -delta_A,
+            "delta_B": -delta_B,
+            "score_C": score_C_reverse,
+            "delta_pm": -delta_pm,
+            "is_home": is_home,
+        }
+        forward_no_bias = sum(
+            coef_by_feature[name] * final_values[name]
+            for name in A.meta["final_feature_order"]
+            if name != "is_home"
+        )
+        reverse_no_bias = sum(
+            coef_by_feature[name] * reverse_values[name]
+            for name in A.meta["final_feature_order"]
+            if name != "is_home"
+        )
+        logit = float((forward_no_bias - reverse_no_bias) / 2)
+    P_home = float(1 / (1 + np.exp(-logit)))
 
     # decompose final logit into per-component contributions for explainability
-    α, β, δ, γ = A.final_clf.coef_[0]
-    b = A.final_clf.intercept_[0]
-    contributions = {
-        "from_score_A":  α * delta_A,
-        "from_score_B":  β * delta_B,
-        "from_delta_pm": δ * delta_pm,
-        "from_is_home":  γ * is_home,
-        "from_intercept": b,
-    }
+    if symmetric:
+        reverse_values = {
+            "delta_A": -delta_A,
+            "delta_B": -delta_B,
+            "score_C": score_C_reverse,
+            "delta_pm": -delta_pm,
+            "is_home": is_home,
+        }
+        contributions = {
+            f"from_{name}": (
+                coef * (final_values[name] - reverse_values[name]) / 2
+                if name != "is_home" else 0.0
+            )
+            for name, coef in zip(A.meta["final_feature_order"], A.final_clf.coef_[0])
+        }
+        contributions["from_intercept"] = 0.0
+    else:
+        contributions = {
+            f"from_{name}": coef * final_values[name]
+            for name, coef in zip(A.meta["final_feature_order"], A.final_clf.coef_[0])
+        }
+        contributions["from_intercept"] = float(A.final_clf.intercept_[0])
 
     return {
         "P_home_win": P_home,
@@ -246,16 +316,22 @@ def predict_matchup(
         "snapshot_date": str(snapshot_date.date()) if snapshot_date is not None else "latest",
         "season_for_p80": season_for_p80,
         "is_home": is_home,
+        "symmetric": symmetric,
         # raw scores
         "score_A_home": home["score_A"],
         "score_A_away": away["score_A"],
         "score_B_home": home["score_B"],
         "score_B_away": away["score_B"],
+        "score_C_raw": score_C_raw,
+        "score_C": score_C,
+        "score_C_reverse_raw": score_C_reverse_raw,
+        "score_C_reverse_z": score_C_reverse,
         "pm_home": home["team_pm"],
         "pm_away": away["team_pm"],
         # standardized deltas
         "delta_A":  delta_A,
         "delta_B":  delta_B,
+        "score_C_z": score_C,
         "delta_pm": delta_pm,
         # additive contributions (sum + sigmoid → P_home)
         "logit_contributions": contributions,
@@ -275,6 +351,7 @@ def summary_table(result: dict) -> pd.DataFrame:
         "Score_B_home": result["score_B_home"],
         "Score_B_away": result["score_B_away"],
         "ΔB_z": result["delta_B"],
+        "Score_C_z": result["score_C_z"],
         "pm_home": result["pm_home"],
         "pm_away": result["pm_away"],
         "Δpm_z": result["delta_pm"],

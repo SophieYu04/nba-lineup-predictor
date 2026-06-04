@@ -1,10 +1,10 @@
 {
-  "alpha_score_A": 0.34794163505201364,
-  "beta_score_B": 0.17638983052752177,
-  "zeta_score_C": -0.02286713114138892,
-  "delta_plus_minus": 0.3186763972316239,
-  "gamma_is_home": 0.11924880976395612,
-  "intercept": 0.12022544865943245,
+  "alpha_score_A": 0.18851081383929866,
+  "beta_score_B": 0.1810053577999468,
+  "zeta_score_C": -0.017915288744033465,
+  "delta_plus_minus": 0.48184248113737677,
+  "gamma_is_home": 0.12795154957510918,
+  "intercept": 0.12895611066305318,
   "train_seasons": [
     "2020-21",
     "2021-22",
@@ -12,9 +12,10 @@
     "2023-24"
   ],
   "test_season": "2024-25",
-  "n_train_matchups": 4722,
+  "n_train_matchups": 3935,
   "n_test_matchups": 1225,
   "output_B_total_features": 54,
+  "output_B_l1_kept_features": 13,
   "output_B_interaction_pairs": 36,
   "output_C_total_features": 81,
   "output_C_l1_kept_features": 31
