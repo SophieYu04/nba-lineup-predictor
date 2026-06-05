@@ -1,5 +1,8 @@
 # OS
 .DS_Store
+
+# Local-only technical notes
+design_b_results.md
 Thumbs.db
 
 # Python
