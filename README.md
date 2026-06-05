@@ -86,7 +86,6 @@ Recent fixes:
 These are intentionally separate:
 
 - [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md): full project summary / final report style writeup.
-- [design_b_results.md](design_b_results.md): technical modeling details and ablations.
 - [data_validation_report.md](data_validation_report.md): data feasibility and join validation.
 - [docs/index.md](docs/index.md): GitHub Pages landing page.
 
